@@ -26,6 +26,16 @@ from features import FEATURE_COLUMNS
 
 SEED = 42
 
+# Roles whose job is to touch every unit. Modeling them alongside clinical
+# staff lets their normal cross-department behavior define the outlier
+# boundary, which is what drowned the snooping scenario in the first pass.
+BACK_OFFICE_ROLES = {"billing", "records_admin"}
+
+# A ratio computed from a handful of events is noise, not signal. A user-day
+# with two events and one cross-department lookup has a ratio of 1.0 and means
+# nothing. These days are excluded from scoring rather than flagged.
+MIN_EVENTS = 10
+
 
 def evaluate(y_true, y_pred, label):
     tp = int(((y_pred == 1) & (y_true == 1)).sum())
@@ -76,6 +86,10 @@ def detection_latency(df):
     detected = [d for _, _, d in rows if d is not None]
     if detected:
         print(f"  mean latency across detected accounts: {np.mean(detected):.1f} days")
+    # Account-level recall is the operationally meaningful number. An analyst
+    # investigates a person, not a calendar square: catching a compromised
+    # account on 3 of its 6 active days still ends the breach on day 3.
+    print(f"  accounts detected: {len(detected)}/{len(rows)}")
     print()
     return rows
 
@@ -85,6 +99,8 @@ def main():
     ap.add_argument("--in", dest="infile", default="data/features.csv")
     ap.add_argument("--out", dest="outfile", default="data/scored.csv")
     ap.add_argument("--contamination", type=float, default=0.01)
+    ap.add_argument("--min-events", type=int, default=MIN_EVENTS)
+    ap.add_argument("--no-role-split", action="store_true")
     ap.add_argument("--n-estimators", type=int, default=300)
     ap.add_argument("--seed", type=int, default=SEED)
     args = ap.parse_args()
@@ -92,26 +108,47 @@ def main():
     df = pd.read_csv(args.infile, parse_dates=["date"])
     y = df["is_anomaly"].astype(int).values
 
-    X = df[FEATURE_COLUMNS].fillna(0.0).values
-    # Isolation Forest is not scale-sensitive in principle, but standardizing
-    # keeps the split thresholds interpretable when features have wildly
-    # different ranges (z-scores up to 25 next to ratios bounded at 1).
-    X = StandardScaler().fit_transform(X)
+    df["pred"] = 0
+    df["risk_score"] = 0.0
 
-    model = IsolationForest(
-        n_estimators=args.n_estimators,
-        contamination=args.contamination,
-        random_state=args.seed,
-        n_jobs=-1,
-    )
-    model.fit(X)
+    scoreable = df["n_events"] >= args.min_events
+    skipped = int((~scoreable).sum())
 
-    # sklearn returns -1 for outliers; higher score_samples means more normal,
-    # so negate to get an intuitive "risk score"
-    df["pred"] = (model.predict(X) == -1).astype(int)
-    df["risk_score"] = -model.score_samples(X)
+    if args.no_role_split:
+        groups = {"all": scoreable}
+    else:
+        back = df["role"].isin(BACK_OFFICE_ROLES)
+        groups = {
+            "clinical": scoreable & ~back,
+            "back_office": scoreable & back,
+        }
 
-    print(f"Scored {len(df):,} user-days on {len(FEATURE_COLUMNS)} features")
+    for name, mask in groups.items():
+        if mask.sum() < 50:
+            continue
+        Xg = df.loc[mask, FEATURE_COLUMNS].fillna(0.0).values
+        # Isolation Forest is not scale-sensitive in principle, but
+        # standardizing keeps split thresholds interpretable when features
+        # have wildly different ranges (z-scores up to 25 next to ratios
+        # bounded at 1).
+        Xg = StandardScaler().fit_transform(Xg)
+
+        model = IsolationForest(
+            n_estimators=args.n_estimators,
+            contamination=args.contamination,
+            random_state=args.seed,
+            n_jobs=-1,
+        )
+        model.fit(Xg)
+        # sklearn returns -1 for outliers; higher score_samples means more
+        # normal, so negate to get an intuitive "risk score"
+        df.loc[mask, "pred"] = (model.predict(Xg) == -1).astype(int)
+        df.loc[mask, "risk_score"] = -model.score_samples(Xg)
+        print(f"  fitted '{name}' on {int(mask.sum()):,} user-days")
+
+    print()
+    print(f"Scored {len(df):,} user-days on {len(FEATURE_COLUMNS)} features "
+          f"({skipped:,} below the {args.min_events}-event floor, not scored)")
     print(f"True anomalous user-days: {int(y.sum())} ({y.mean()*100:.2f}%)")
     print()
 

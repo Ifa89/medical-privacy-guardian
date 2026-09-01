@@ -65,6 +65,8 @@ def build_daily_aggregates(df):
         rows.append({
             "user_id": uid,
             "date": date,
+            "role": g["role"].iloc[0],
+            "department": g["department"].iloc[0],
             "n_events": len(g),
             "cross_dept_ratio": float(g["is_cross_dept"].mean()),
             "n_distinct_patients": int(g["patient_token"].nunique()),
@@ -95,7 +97,7 @@ def add_leave_one_out_profile_features(daily, events):
         for date, target in by_date.items():
             other = user_events[user_events["date"] != date]
             if len(other) == 0:
-                records.append((uid, date, 0.0, 0.0))
+                records.append((uid, date, 0.0, 0.0, 0.0))
                 continue
 
             hour_share = other["hour"].value_counts(normalize=True)
@@ -104,14 +106,24 @@ def add_leave_one_out_profile_features(daily, events):
             ws_share = other["workstation_id"].value_counts(normalize=True)
             familiar_ws = set(ws_share[ws_share >= FAMILIARITY_THRESHOLD].index)
 
+            # Departments this user routinely serves. A nurse serves one unit
+            # and dips into others rarely, so almost every other unit is
+            # "rare" for her. Billing serves all units evenly, so nothing is
+            # rare for them -- which is exactly the asymmetry that separates
+            # a snooping nurse from a billing clerk having a quiet day.
+            dept_share = other["patient_department"].value_counts(normalize=True)
+            familiar_depts = set(dept_share[dept_share >= FAMILIARITY_THRESHOLD].index)
+
             records.append((
                 uid, date,
                 float((~target["hour"].isin(familiar_hours)).mean()),
                 float((~target["workstation_id"].isin(familiar_ws)).mean()),
+                float((~target["patient_department"].isin(familiar_depts)).mean()),
             ))
 
     prof = pd.DataFrame(records, columns=[
-        "user_id", "date", "off_hours_ratio", "new_workstation_ratio"])
+        "user_id", "date", "off_hours_ratio", "new_workstation_ratio",
+        "rare_dept_ratio"])
     return daily.merge(prof, on=["user_id", "date"], how="left")
 
 
@@ -158,6 +170,7 @@ FEATURE_COLUMNS = [
     "cross_dept_ratio",
     "off_hours_ratio",
     "new_workstation_ratio",
+    "rare_dept_ratio",
     "export_ratio",
     "search_ratio",
     "burst_intensity",
