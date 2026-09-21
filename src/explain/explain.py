@@ -152,21 +152,70 @@ def assign_tier(row):
     return tier, reasons
 
 
-def explain(client, model, context, max_tokens=1000):
-    resp = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": json.dumps(context, indent=2)}],
-    )
-    text = "".join(b.text for b in resp.content if b.type == "text")
-    cleaned = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+def extract_json(text):
+    """Pull a JSON object out of the response.
+
+    The model is asked for bare JSON, but defensive parsing is cheap: strip
+    markdown fences if present, then fall back to the outermost braces.
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1]
+        cleaned = cleaned.rsplit("```", 1)[0]
+    cleaned = cleaned.strip()
+
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        return {"summary": text, "assessment": "parse_error",
-                "recommended_actions": [], "confidence": "low",
-                "hipaa_concern": None, "reasoning": ""}
+        pass
+
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(cleaned[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def explain(client, model, context, max_tokens=2000, attempts=3):
+    """Returns (result_dict, ok). ok is False when the response could not be
+    parsed after every attempt, so the caller knows not to cache it.
+
+    Malformed JSON is a transient generation error rather than a systematic
+    one, so a plain retry recovers it. Each retry is a fresh request; no
+    conversation state carries over.
+    """
+    last_text, last_stop = "", None
+
+    for attempt in range(attempts):
+        resp = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": json.dumps(context, indent=2)}],
+        )
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        last_text, last_stop = text, getattr(resp, "stop_reason", None)
+
+        parsed = extract_json(text)
+        if parsed is not None:
+            return parsed, True
+
+        if attempt < attempts - 1:
+            print(f"    (malformed JSON, retrying {attempt + 2}/{attempts})")
+
+    note = ("response hit the max_tokens ceiling and was cut off; "
+            "raise --max-tokens" if last_stop == "max_tokens" else
+            f"response was not valid JSON after {attempts} attempts")
+    return {
+        "summary": last_text,
+        "assessment": "parse_error",
+        "reasoning": note,
+        "hipaa_concern": None,
+        "recommended_actions": [],
+        "confidence": "low",
+    }, False
 
 
 TIER_ACTIONS = {
@@ -216,6 +265,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="print the assembled context and exit without calling the API")
     ap.add_argument("--no-cache", action="store_true")
+    ap.add_argument("--max-tokens", type=int, default=2000)
     args = ap.parse_args()
 
     scored, logs = load_context(args.scored, args.logs)
@@ -257,8 +307,11 @@ def main():
         if cache_file.exists() and not args.no_cache:
             result = json.loads(cache_file.read_text())
         else:
-            result = explain(client, args.model, ctx)
-            cache_file.write_text(json.dumps(result, indent=2))
+            result, ok = explain(client, args.model, ctx, args.max_tokens)
+            # Caching a failed parse would replay the failure on every rerun
+            # and quietly hide it. Only successful responses are stored.
+            if ok:
+                cache_file.write_text(json.dumps(result, indent=2))
 
         truth = row["attack_type"] if row["is_anomaly"] else "not an attack (false positive)"
         render(ctx, tier, reasons, result, truth)

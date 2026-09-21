@@ -9,7 +9,7 @@ Healthcare breaches take an average of 279 days to detect. This system is built
 to compress that to hours, and to explain what it found rather than emitting a
 score.
 
-**Status:** M1–M3 complete, M4 in progress. This is an active personal project.
+**Status:** M1–M4 complete, M6 next. This is an active personal project.
 
 **Methodology, data provenance, and feature definitions:
 [docs/DATA.md](docs/DATA.md).**
@@ -58,25 +58,29 @@ department, or date is passed to the model. Full definitions in
 
 | Metric | Per-user model | Naive global threshold |
 |---|---|---|
-| Precision | 0.294 | 0.077 |
-| Recall (user-day) | 0.455 | 0.136 |
-| **F1** | **0.357** | 0.098 |
+| Precision | 0.357 | 0.071 |
+| Recall (user-day) | 0.455 | 0.091 |
+| **F1** | **0.400** | 0.080 |
 | Accounts detected | **7 / 7** | — |
 | Mean detection latency | **0.9 days** | — |
 
 **The naive baseline is constructed in `detect.py`, not taken from an external
-source.** It counts how many user-days the Isolation Forest flagged (34), then
-flags the 34 user-days with the highest raw event count — landing on a threshold
-of 70 events. This is roughly what a naive SIEM rule does: "alert when someone
+source.** It counts how many user-days the Isolation Forest flagged (28), then
+flags the 28 user-days with the highest raw event count — landing on a threshold
+of 72 events. This is roughly what a naive SIEM rule does: "alert when someone
 accesses more than N records in a day." Matching alert volume is what makes the
 comparison fair; any detector reaches perfect recall by flagging everything, so
 holding alert count constant means both approaches compete for the same analyst
 attention and only accuracy differs.
 
-Per-user normalization measures about 3.6× better by F1. The clearest single
+Per-user normalization measures 0.400 against 0.080. Note that the ratio
+between them is not a stable figure: because the baseline is re-tuned to
+whatever alert volume the model produces, improving the model raises its
+threshold and lowers its score. The absolute numbers are the honest
+comparison. The clearest single
 case: compromised account U0124 generated 63 accesses on its attack day — below
-the naive threshold of 70, so the global rule misses it entirely, but more than
-double that user's own median of 13, so the per-user model flags it on day one.
+the naive threshold of 72, so the global rule misses it entirely, but nearly 5×
+that user's own median of 13, so the per-user model flags it on day one.
 
 Recall by scenario:
 
@@ -168,6 +172,20 @@ every unit, so their normal cross-department behavior was defining the outlier
 boundary for clinical staff. Splitting the models was a large part of the jump
 from F1 0.167 to 0.357.
 
+**Suppressing below-baseline-volume days.** Isolation Forest isolates outliers
+in both directions, so user-days where someone did far *less* work than usual
+scored as anomalous — eight of the false positives were people on a half day.
+A quiet day is not a security event. This is a domain prior rather than a tuned
+threshold: no insider threat manifests as reduced activity. Suppressing alerts
+below the user's own baseline volume removed 6 false positives and cost no true
+positives, taking F1 from 0.357 to 0.400.
+
+This fix came out of the explanation layer. Reviewing the generated analyst
+summaries, the LLM independently observed that several flagged days showed
+"all deviation scores negative, meaning activity was lower than baseline, not
+anomalously high." The explainability layer surfaced a defect in the detection
+layer.
+
 **No PHI reaches the model.** Patient identifiers are SHA-256 tokenized at
 generation. The explanation layer sends only aggregates — "240 distinct records
 across 6 units", never a patient.
@@ -181,11 +199,67 @@ approval.
 
 ---
 
+## What improved the model
+
+Three iterations, each driven by a specific observed failure rather than
+parameter search.
+
+| Iteration | Change | F1 |
+|---|---|---|
+| Baseline | Isolation Forest on per-user z-scores | 0.167 |
+| +Role split, event floor, rare-dept feature | See below | 0.357 |
+| +Low-volume suppression | See below | **0.400** |
+
+**Iteration 1 → 2.** The first model caught both loud attacks perfectly and
+found the low-and-slow snooping scenario 5.6% of the time. It was not detecting
+anomalies; it was detecting activity level. Three fixes: separate models per
+role group (billing staff legitimately touch every unit, so their normal
+behavior was defining the outlier boundary for clinical staff), a 10-event floor
+(a cross-department ratio computed from two events is noise), and a
+`rare_dept_ratio` feature measuring access to units a user has *never* visited
+rather than how often they go cross-department.
+
+**Iteration 2 → 3.** The explanation layer surfaced a bug in the detector.
+Reviewing generated explanations for the false positives showed that four of six
+were flagged for doing *less* work than normal — 13 accesses against a median of
+53, for example. Isolation Forest isolates outliers in both directions, but a
+quiet day is not a security event. Suppressing alerts below the user's own
+baseline volume removed 6 false positives with no loss of true positives.
+
+This is worth stating plainly: the LLM explanation layer improved the ML
+detection layer. That was not the intended purpose of the component.
+
+---
+
+## Explanation layer
+
+Flagged user-days are sent to the Anthropic API as aggregate statistics — never
+patient data — and returned as an analyst-readable summary with a HIPAA mapping
+and recommended actions.
+
+Assessed on the top 10 alerts (4 true attacks, 6 false positives):
+
+- **No false positive was ever assessed as `likely_incident`.** This was the failure mode of concern: an explanation layer that manufactures a threat narrative because the framing primes it to expect one is worse than no explanation, since it launders a model error into authoritative prose.
+- Explanations correctly reasoned about what evidence *rules out*. On the exfiltration case it noted the familiar workstation argues against remote credential theft; on the compromise case it noted near-zero exports argue against exfiltration.
+- Recommended actions were operationally specific — checking badge swipes and VPN logs against an unfamiliar workstation, confirming float-coverage assignments with a charge nurse.
+
+**Current weakness:** after low-volume suppression removed the clearest benign
+cases, 8 of 10 remaining alerts return `needs_review` with `medium` confidence,
+including one real attack. The three-bucket assessment no longer discriminates
+usefully. A numeric 0–100 rating would let alerts rank rather than cluster.
+
+---
+
 ## Known limitations
 
-- **Precision is 0.294.** Roughly two in three alerts are false positives. At
+- **Precision is 0.357.** Roughly two in three alerts are false positives. At
   150 users that is about one nuisance alert per day; at 5,000 users it would be
   30+, which is how alert fatigue starts. Not yet solved.
+- **The explanation layer's assessment buckets do not discriminate.** After
+  low-volume suppression removed the clearest benign cases, 8 of 10 remaining
+  alerts return `needs_review` with `medium` confidence — including one real
+  attack. An analyst gets no prioritization signal from that. A numeric 0–100
+  rating would let alerts rank rather than cluster.
 - **Low-and-slow snooping is caught on only a third of its active days.** The
   scenario adds fewer events than the user's normal daily volume, at normal
   hours, from a normal workstation. Detected at the account level, but not
@@ -207,7 +281,7 @@ approval.
 - [x] M1 — Synthetic EHR access log generator
 - [x] M2 — Attack injection with ground-truth labels
 - [x] M3 — Isolation Forest on per-user baselines
-- [ ] M4 — Anthropic API explanation layer
+- [x] M4 — Anthropic API explanation layer
 - [ ] M5 — Tiered automated response with audit logging
 - [ ] M6 — React analyst dashboard
 

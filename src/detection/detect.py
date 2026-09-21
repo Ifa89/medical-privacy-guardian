@@ -36,6 +36,17 @@ BACK_OFFICE_ROLES = {"billing", "records_admin"}
 # nothing. These days are excluded from scoring rather than flagged.
 MIN_EVENTS = 10
 
+# Isolation Forest isolates outliers in BOTH directions, so a user-day where
+# someone did far LESS work than usual scores as anomalous. A quiet day is not
+# a security event. This is a domain prior, not a tuned threshold: no insider
+# threat manifests as reduced activity, so alerts below the user's own baseline
+# volume are suppressed regardless of what the model scored them.
+#
+# -0.5 rather than 0.0 because the low-and-slow snooping scenario can occur on
+# a day with slightly below-median total volume; cutting at zero loses one of
+# those true positives.
+MIN_Z_EVENTS = -0.5
+
 
 def evaluate(y_true, y_pred, label):
     tp = int(((y_pred == 1) & (y_true == 1)).sum())
@@ -101,6 +112,8 @@ def main():
     ap.add_argument("--contamination", type=float, default=0.01)
     ap.add_argument("--min-events", type=int, default=MIN_EVENTS)
     ap.add_argument("--no-role-split", action="store_true")
+    ap.add_argument("--min-z-events", type=float, default=MIN_Z_EVENTS,
+                    help="suppress alerts on days below this volume z-score")
     ap.add_argument("--n-estimators", type=int, default=300)
     ap.add_argument("--seed", type=int, default=SEED)
     args = ap.parse_args()
@@ -146,9 +159,16 @@ def main():
         df.loc[mask, "risk_score"] = -model.score_samples(Xg)
         print(f"  fitted '{name}' on {int(mask.sum()):,} user-days")
 
+    # Suppress alerts on below-baseline-volume days (see MIN_Z_EVENTS above)
+    quiet = (df["pred"] == 1) & (df["z_n_events"] <= args.min_z_events)
+    n_quiet = int(quiet.sum())
+    df.loc[quiet, "pred"] = 0
+
     print()
     print(f"Scored {len(df):,} user-days on {len(FEATURE_COLUMNS)} features "
           f"({skipped:,} below the {args.min_events}-event floor, not scored)")
+    print(f"Suppressed {n_quiet} alert(s) on below-baseline-volume days "
+          f"(z_n_events <= {args.min_z_events})")
     print(f"True anomalous user-days: {int(y.sum())} ({y.mean()*100:.2f}%)")
     print()
 
