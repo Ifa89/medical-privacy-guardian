@@ -9,7 +9,7 @@ Healthcare breaches take an average of 279 days to detect. This system is built
 to compress that to hours, and to explain what it found rather than emitting a
 score.
 
-**Status:** M1–M4 complete, M6 next. This is an active personal project.
+**Status:** M1–M4 and M6 complete; M5 remaining. This is an active personal project.
 
 **Methodology, data provenance, and feature definitions:
 [docs/DATA.md](docs/DATA.md).**
@@ -250,6 +250,29 @@ usefully. A numeric 0–100 rating would let alerts rank rather than cluster.
 
 ---
 
+## Dashboard
+
+A React interface for reviewing flagged days. Alerts are listed by risk with a
+colour-coded response tier; selecting one shows the day's measurements, the
+generated explanation, and the rules that set its tier.
+
+Every row carries a thirty-day strip of that person's own daily access counts,
+with the flagged day highlighted and their median drawn as a dashed line. This
+is the project's argument made visible: U0114's 244 accesses tower over a
+personal history of about 11 a day, while U0124's 63 looks unremarkable in
+absolute terms yet clearly breaks their own pattern. A global threshold cannot
+separate those two cases.
+
+```bash
+python src/dashboard/export_data.py     # writes dashboard/public/data.json
+cd dashboard && npm install && npm run dev
+```
+
+The dashboard is static with no backend — everything it needs is flattened into
+one JSON bundle at build time. Patient tokens never appear in it.
+
+---
+
 ## Known limitations
 
 - **Precision is 0.357.** Roughly two in three alerts are false positives. At
@@ -282,8 +305,8 @@ usefully. A numeric 0–100 rating would let alerts rank rather than cluster.
 - [x] M2 — Attack injection with ground-truth labels
 - [x] M3 — Isolation Forest on per-user baselines
 - [x] M4 — Anthropic API explanation layer
+- [x] M6 — React analyst dashboard
 - [ ] M5 — Tiered automated response with audit logging
-- [ ] M6 — React analyst dashboard
 
 ---
 
